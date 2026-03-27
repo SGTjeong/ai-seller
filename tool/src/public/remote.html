@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Remote Browser Control</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      touch-action: none;
+    }
+
+    body {
+      background: #0a0a0a;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .header {
+      padding: 8px 16px;
+      background: #1a1a1a;
+      border-bottom: 1px solid #333;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #f00;
+    }
+
+    .status-dot.connected {
+      background: #0f0;
+    }
+
+    .canvas-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #screen {
+      max-width: 100%;
+      max-height: 100%;
+      border: 1px solid #333;
+      touch-action: none;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .debug {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.8);
+      color: #0f0;
+      padding: 8px;
+      font-size: 12px;
+      font-family: monospace;
+      z-index: 999;
+    }
+
+    .notification {
+      position: fixed;
+      top: 60px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 100;
+      animation: fadeInOut 3s forwards;
+    }
+
+    .notification.info { background: #1e40af; }
+    .notification.warning { background: #b45309; }
+    .notification.error { background: #b91c1c; }
+
+    @keyframes fadeInOut {
+      0% { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+      10% { opacity: 1; transform: translateX(-50%) translateY(0); }
+      90% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+
+    .help {
+      font-size: 12px;
+      color: #888;
+    }
+
+    .waiting {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: #666;
+    }
+
+    .waiting .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #333;
+      border-top-color: #0f0;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 16px;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Connecting...</span>
+    </div>
+    <div class="help">Drag to control</div>
+  </div>
+
+  <div class="canvas-container">
+    <div class="waiting" id="waiting">
+      <div class="spinner"></div>
+      <p>Waiting for browser...</p>
+    </div>
+    <canvas id="screen" width="1280" height="720"></canvas>
+  </div>
+  <div class="debug" id="debug">Touch: waiting...</div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const waiting = document.getElementById('waiting');
+
+    let isDragging = false;
+    let hasReceivedFrame = false;
+    let canvasScale = 1;
+    let canvasOffsetX = 0;
+    let canvasOffsetY = 0;
+
+    // 연결 상태 관리
+    socket.on('connect', () => {
+      statusDot.classList.add('connected');
+      statusText.textContent = 'Connected';
+    });
+
+    socket.on('disconnect', () => {
+      statusDot.classList.remove('connected');
+      statusText.textContent = 'Disconnected';
+    });
+
+    // 스크린샷 수신
+    socket.on('frame', (base64) => {
+      if (!hasReceivedFrame) {
+        hasReceivedFrame = true;
+        waiting.style.display = 'none';
+      }
+
+      const img = new Image();
+      img.onload = () => {
+        // Canvas 크기를 이미지에 맞게 조정
+        if (canvas.width !== img.width || canvas.height !== img.height) {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          updateCanvasTransform();
+        }
+        ctx.drawImage(img, 0, 0);
+      };
+      img.src = 'data:image/jpeg;base64,' + base64;
+    });
+
+    // 알림 수신
+    socket.on('notification', (data) => {
+      showNotification(data.message, data.type);
+    });
+
+    function showNotification(message, type = 'info') {
+      const div = document.createElement('div');
+      div.className = `notification ${type}`;
+      div.textContent = message;
+      document.body.appendChild(div);
+      setTimeout(() => div.remove(), 3000);
+    }
+
+    // Canvas 변환 계산 (반응형)
+    function updateCanvasTransform() {
+      const container = canvas.parentElement;
+      const containerRect = container.getBoundingClientRect();
+      const scaleX = containerRect.width / canvas.width;
+      const scaleY = containerRect.height / canvas.height;
+      canvasScale = Math.min(scaleX, scaleY, 1);
+
+      canvas.style.width = (canvas.width * canvasScale) + 'px';
+      canvas.style.height = (canvas.height * canvasScale) + 'px';
+    }
+
+    // 좌표 변환 (화면 좌표 → 브라우저 좌표)
+    function getCoordinates(e) {
+      const rect = canvas.getBoundingClientRect();
+      let clientX, clientY;
+
+      if (e.touches) {
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
+      } else {
+        clientX = e.clientX;
+        clientY = e.clientY;
+      }
+
+      const x = (clientX - rect.left) / canvasScale;
+      const y = (clientY - rect.top) / canvasScale;
+
+      return { x: Math.round(x), y: Math.round(y) };
+    }
+
+    // 마우스 이벤트
+    canvas.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      isDragging = true;
+      const coords = getCoordinates(e);
+      socket.emit('mouse', { type: 'down', ...coords });
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      e.preventDefault();
+      const coords = getCoordinates(e);
+      socket.emit('mouse', { type: 'move', ...coords });
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      e.preventDefault();
+      isDragging = false;
+      const coords = getCoordinates(e);
+      socket.emit('mouse', { type: 'up', ...coords });
+    });
+
+    canvas.addEventListener('click', (e) => {
+      const coords = getCoordinates(e);
+      socket.emit('mouse', { type: 'click', ...coords });
+    });
+
+    // 디버그 표시
+    const debug = document.getElementById('debug');
+    function log(msg) {
+      debug.textContent = msg;
+      console.log(msg);
+    }
+
+    // 터치 이벤트 (모바일)
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      isDragging = true;
+      const coords = getCoordinates(e);
+      log(`DOWN: ${coords.x}, ${coords.y}`);
+      socket.emit('mouse', { type: 'down', ...coords });
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (e) => {
+      if (!isDragging) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const coords = getCoordinates(e);
+      log(`MOVE: ${coords.x}, ${coords.y}`);
+      socket.emit('mouse', { type: 'move', ...coords });
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      isDragging = false;
+      const touch = e.changedTouches[0];
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round((touch.clientX - rect.left) / canvasScale);
+      const y = Math.round((touch.clientY - rect.top) / canvasScale);
+      log(`UP: ${x}, ${y}`);
+      socket.emit('mouse', { type: 'up', x, y });
+    }, { passive: false });
+
+    // 스크롤 (PC)
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      socket.emit('scroll', { deltaX: e.deltaX, deltaY: e.deltaY });
+    });
+
+    // 창 크기 변경 시 재계산
+    window.addEventListener('resize', updateCanvasTransform);
+
+    // 초기화
+    updateCanvasTransform();
+  </script>
+</body>
+</html>

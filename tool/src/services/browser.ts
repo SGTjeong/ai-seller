@@ -5,7 +5,7 @@ let browser: Browser | null = null;
 export async function getBrowser(): Promise<Browser> {
   if (!browser) {
     browser = await chromium.launch({
-      headless: true,
+      headless: false, // 화면 보이게 (원격 제어용)
     });
   }
   return browser;
