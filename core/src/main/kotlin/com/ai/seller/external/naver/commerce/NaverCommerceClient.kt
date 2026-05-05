@@ -1,4 +1,4 @@
-package com.ai.seller.external.naver
+package com.ai.seller.external.naver.commerce
 
 import org.mindrot.jbcrypt.BCrypt
 import org.springframework.http.MediaType
@@ -13,7 +13,7 @@ import java.time.format.DateTimeFormatter
 import java.util.*
 
 @Component
-class NaverClient {
+class NaverCommerceClient {
     private val restClient = RestClient.builder()
         .baseUrl("https://api.commerce.naver.com")
         .build()

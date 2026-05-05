@@ -1,12 +1,12 @@
-package com.ai.seller.external.naver
+package com.ai.seller.external.naver.commerce
 
 import org.junit.jupiter.api.Test
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 
-class NaverClientTest {
-    private val client = NaverClient()
+class NaverCommerceClientTest {
+    private val client = NaverCommerceClient()
 
     private val clientId = "REDACTED"
     private val clientSecret = "REDACTED"

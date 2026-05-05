@@ -1,4 +1,4 @@
-package com.ai.seller.external.naver
+package com.ai.seller.external.naver.commerce
 
 import com.ai.seller.domain.Order
 import java.time.Instant

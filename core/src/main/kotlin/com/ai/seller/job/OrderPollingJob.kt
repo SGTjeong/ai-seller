@@ -1,7 +1,7 @@
 package com.ai.seller.job
 
 import com.ai.seller.domain.*
-import com.ai.seller.external.naver.NaverClient
+import com.ai.seller.external.naver.commerce.NaverCommerceClient
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import java.time.Instant
@@ -11,7 +11,7 @@ import java.time.temporal.ChronoUnit
 class OrderPollingJob(
     private val userRepository: UserRepository,
     private val fulfillmentRepository: FulfillmentRepository,
-    private val naverClient: NaverClient,
+    private val naverClient: NaverCommerceClient,
 ) {
 
     @Scheduled(fixedDelay = 60_000) // 1분마다
