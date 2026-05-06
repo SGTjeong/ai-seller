@@ -178,4 +178,74 @@ class NaverDatalabClientTest {
         assertNotNull(NaverDatalabClient.CATEGORIES["스포츠/레저"])
         assertNotNull(NaverDatalabClient.CATEGORIES["디지털/가전"])
     }
+
+    @Test
+    fun `getCategories - 가구인테리어 서브카테고리 조회`() {
+        val furnitureCid = NaverDatalabClient.CATEGORIES["가구/인테리어"]!!
+        val response = client.getCategories(furnitureCid)
+
+        println("=== 가구/인테리어 서브카테고리 ===")
+        response?.childList?.forEach { child ->
+            println("${child.cid}: ${child.name}")
+        }
+
+        assertNotNull(response?.childList)
+        assertTrue(response!!.childList!!.isNotEmpty())
+    }
+
+    @Test
+    fun `getKeywordRank - 거실가구 500개 키워드 조회`() {
+        val cid = NaverDatalabClient.SUB_CATEGORIES["가구/인테리어>거실가구"]!!
+        val allKeywords = mutableListOf<KeywordRank>()
+        val pageSize = 20  // API 실제 반환 최대 개수
+        var page = 1
+        var rateLimitRetryCount = 0
+        val maxRateLimitRetries = 3
+
+        println("=== 가구/인테리어 > 거실가구 키워드 500개 조회 시작 ===")
+
+        while (allKeywords.size < 500) {
+            when (val result = client.getKeywordRank(cid = cid, count = pageSize, page = page)) {
+                is KeywordRankResult.Success -> {
+                    if (result.data.ranks.isEmpty()) {
+                        println("페이지 $page: 더 이상 데이터 없음")
+                        break
+                    }
+                    allKeywords.addAll(result.data.ranks)
+                    println("페이지 $page: ${result.data.ranks.size}개 조회 (누적: ${allKeywords.size}개)")
+                    page++
+                    rateLimitRetryCount = 0
+                }
+                is KeywordRankResult.Empty -> {
+                    println("페이지 $page: 더 이상 데이터 없음 (Empty)")
+                    break
+                }
+                is KeywordRankResult.RateLimited -> {
+                    rateLimitRetryCount++
+                    if (rateLimitRetryCount > maxRateLimitRetries) {
+                        println("페이지 $page: Rate Limit 재시도 횟수 초과")
+                        break
+                    }
+                    println("페이지 $page: Rate Limited - 1분 대기 후 재시도 ($rateLimitRetryCount/$maxRateLimitRetries)")
+                    Thread.sleep(60_000)
+                    continue
+                }
+                is KeywordRankResult.Error -> {
+                    println("페이지 $page: 에러 - ${result.message}")
+                    break
+                }
+            }
+            Thread.sleep(100)
+        }
+
+        println("\n=== 총 ${allKeywords.size}개 키워드 ===")
+        allKeywords.take(50).forEach { rank ->
+            println("${rank.rank}. ${rank.keyword}")
+        }
+        if (allKeywords.size > 50) {
+            println("... 외 ${allKeywords.size - 50}개")
+        }
+
+        assertTrue(allKeywords.isNotEmpty(), "키워드가 조회되어야 함")
+    }
 }

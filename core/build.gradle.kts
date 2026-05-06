@@ -28,6 +28,7 @@ dependencies {
     implementation("org.mindrot:jbcrypt:0.4")
     implementation("com.microsoft.playwright:playwright:1.52.0")
     implementation("org.jsoup:jsoup:1.18.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     runtimeOnly("com.h2database:h2")
     testImplementation("org.springframework.boot:spring-boot-starter-data-jpa-test")
     testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
