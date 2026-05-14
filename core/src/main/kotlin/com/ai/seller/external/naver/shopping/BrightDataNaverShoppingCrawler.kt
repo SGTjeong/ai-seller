@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
+import org.springframework.http.client.SimpleClientHttpRequestFactory
 import org.springframework.stereotype.Component
 import org.springframework.web.client.RestClient
 import java.net.URLEncoder
@@ -16,17 +17,30 @@ import java.nio.charset.StandardCharsets
  *
  * 동작:
  *  - 검색페이지: dataset_id 호출 → page_html 받아 Jsoup으로 상품수 추출
+ *  - 일시적 실패(API 오류, 차단, 추출 실패) 시 최대 3회까지 재시도
  */
 @Component
 class BrightDataNaverShoppingCrawler(
     @Value("\${brightdata.token:}") private val token: String = "",
     @Value("\${brightdata.dataset-id:gd_m6gjtfmeh43we6cqc}") private val datasetId: String = "gd_m6gjtfmeh43we6cqc",
-    @Value("\${brightdata.timeout-seconds:120}") private val timeoutSeconds: Int = 120
+    @Value("\${brightdata.timeout-seconds:120}") private val timeoutSeconds: Int = 120,
+    @Value("\${brightdata.max-attempts:3}") private val maxAttempts: Int = 3,
+    @Value("\${brightdata.retry-base-delay-ms:5000}") private val retryBaseDelayMs: Long = 5000,
+    @Value("\${brightdata.poll-interval-ms:5000}") private val pollIntervalMs: Long = 5000,
+    @Value("\${brightdata.poll-max-attempts:36}") private val pollMaxAttempts: Int = 36
 ) {
     private val logger = LoggerFactory.getLogger(BrightDataNaverShoppingCrawler::class.java)
 
+    // RestClient에 connect/read timeout을 명시적으로 설정.
+    // 미설정 시 BrightData 서버 응답이 끊겼을 때(예: 502 후 hang) 무한 대기로 polling이 멈춤.
     private val restClient = RestClient.builder()
         .baseUrl("https://api.brightdata.com")
+        .requestFactory(
+            SimpleClientHttpRequestFactory().apply {
+                setConnectTimeout(10_000)
+                setReadTimeout(90_000)
+            }
+        )
         .build()
 
     /**
@@ -36,35 +50,8 @@ class BrightDataNaverShoppingCrawler(
         if (token.isBlank()) {
             return ProductCountResult.Error(keyword, "BrightData token not configured")
         }
-
-        return try {
-            val searchUrl = buildSearchUrl(keyword)
-            logger.info("Fetching product count for keyword: $keyword, url: $searchUrl")
-
-            val html = fetchPageHtml(searchUrl)
-            if (html == null) {
-                logger.warn("Failed to fetch page HTML for keyword: $keyword")
-                return ProductCountResult.Error(keyword, "Failed to fetch page")
-            }
-
-            // 차단 감지
-            if (html.contains("접속이 일시적으로 제한") || html.contains("보안 확인")) {
-                logger.warn("Access blocked for keyword: $keyword")
-                return ProductCountResult.Blocked(keyword)
-            }
-
-            val count = extractProductCount(html)
-            if (count != null) {
-                logger.info("Product count for '$keyword': $count")
-                ProductCountResult.Success(keyword, count)
-            } else {
-                logger.warn("Product count not found for keyword: $keyword")
-                ProductCountResult.NotFound(keyword)
-            }
-        } catch (e: Exception) {
-            logger.error("Error crawling keyword: $keyword", e)
-            ProductCountResult.Error(keyword, e.message ?: "Unknown error")
-        }
+        val searchUrl = buildSearchUrl(keyword)
+        return crawlWithRetry(keyword, searchUrl, label = "total")
     }
 
     /**
@@ -72,6 +59,76 @@ class BrightDataNaverShoppingCrawler(
      */
     fun getProductCounts(keywords: List<String>): Map<String, ProductCountResult> {
         return keywords.associateWith { getProductCount(it) }
+    }
+
+    /**
+     * 전체 + 해외직구 상품수 동시 조회 (두 번의 API 호출)
+     * 해외직구 상품수는 productSet=overseas 파라미터를 사용해야 정확히 가져올 수 있음
+     */
+    fun getProductCountWithForeign(keyword: String): ProductCountWithForeignResult {
+        if (token.isBlank()) {
+            val error = ProductCountResult.Error(keyword, "BrightData token not configured")
+            return ProductCountWithForeignResult(keyword, error, error)
+        }
+
+        val totalResult = crawlWithRetry(keyword, buildSearchUrl(keyword), label = "total")
+        val foreignResult = crawlWithRetry(keyword, buildSearchUrl(keyword, overseas = true), label = "foreign")
+        return ProductCountWithForeignResult(keyword, totalResult, foreignResult)
+    }
+
+    /**
+     * 단일 URL 크롤링 + 최대 maxAttempts 회 재시도.
+     * Success가 나오면 즉시 반환, 그 외(Error/Blocked/NotFound)는 백오프 후 재시도.
+     */
+    private fun crawlWithRetry(keyword: String, url: String, label: String): ProductCountResult {
+        var last: ProductCountResult = ProductCountResult.Error(keyword, "no attempts made")
+        for (attempt in 1..maxAttempts) {
+            last = crawlOnce(keyword, url, label, attempt)
+            if (last is ProductCountResult.Success) return last
+            if (attempt < maxAttempts) {
+                // exponential backoff: base, base*2, base*4, ...
+                val delay = retryBaseDelayMs * (1L shl (attempt - 1))
+                logger.warn("Retrying $label '$keyword' (attempt ${attempt + 1}/$maxAttempts) after ${delay}ms — last=$last")
+                try {
+                    Thread.sleep(delay)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return last
+                }
+            }
+        }
+        logger.warn("Exhausted $maxAttempts attempts for $label '$keyword' — final=$last")
+        return last
+    }
+
+    private fun crawlOnce(keyword: String, url: String, label: String, attempt: Int): ProductCountResult {
+        return try {
+            logger.info("Fetching $label count for keyword: $keyword (attempt $attempt/$maxAttempts), url: $url")
+            val html = fetchPageHtml(url)
+            when {
+                html == null -> {
+                    logger.warn("Failed to fetch page HTML ($label) for keyword: $keyword")
+                    ProductCountResult.Error(keyword, "Failed to fetch page")
+                }
+                html.contains("접속이 일시적으로 제한") || html.contains("보안 확인") -> {
+                    logger.warn("Access blocked ($label) for keyword: $keyword")
+                    ProductCountResult.Blocked(keyword)
+                }
+                else -> {
+                    val count = extractProductCount(html)
+                    if (count != null) {
+                        logger.info("$label product count for '$keyword': $count")
+                        ProductCountResult.Success(keyword, count)
+                    } else {
+                        logger.warn("Product count not found ($label) for keyword: $keyword")
+                        ProductCountResult.NotFound(keyword)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.error("Error crawling $label keyword: $keyword (attempt $attempt)", e)
+            ProductCountResult.Error(keyword, e.message ?: "Unknown error")
+        }
     }
 
     /**
@@ -97,13 +154,91 @@ class BrightDataNaverShoppingCrawler(
 
             logger.debug("BrightData response length: ${response.length}")
 
-            // 응답 형식: [{"page_html": "...", ...}]
-            // page_html 필드 추출 (JSON 파서 대신 문자열 처리)
+            // sync 응답에 page_html이 있으면 즉시 추출
+            if (response.contains("\"page_html\":\"")) {
+                return extractPageHtmlFromJson(response)
+            }
+
+            // sync timeout 시 BrightData가 snapshot_id만 반환하고 비동기 모드로 전환됨.
+            // → progress polling 후 snapshot 다운로드.
+            val snapshotId = extractStringField(response, "snapshot_id")
+            if (snapshotId != null) {
+                logger.info("Sync timeout — polling snapshot $snapshotId")
+                return pollSnapshotForHtml(snapshotId)
+            }
+
+            // 그 외(에러 응답 등) — 진단 로그 남기고 null
             extractPageHtmlFromJson(response)
         } catch (e: Exception) {
             logger.error("BrightData API call failed", e)
             null
         }
+    }
+
+    /**
+     * 비동기 모드 응답을 받았을 때 progress polling → snapshot 다운로드.
+     */
+    private fun pollSnapshotForHtml(snapshotId: String): String? {
+        for (attempt in 1..pollMaxAttempts) {
+            try {
+                Thread.sleep(pollIntervalMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+
+            val progress = try {
+                restClient.get()
+                    .uri("/datasets/v3/progress/$snapshotId")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer $token")
+                    .retrieve()
+                    .body(String::class.java)
+            } catch (e: Exception) {
+                logger.warn("Progress poll failed for $snapshotId: ${e.message}")
+                null
+            } ?: continue
+
+            when (val status = extractStringField(progress, "status")) {
+                "ready" -> return downloadSnapshot(snapshotId)
+                "failed" -> {
+                    logger.warn("Snapshot $snapshotId failed: ${progress.take(200)}")
+                    return null
+                }
+                else -> logger.debug("Snapshot $snapshotId status=$status (poll $attempt/$pollMaxAttempts)")
+            }
+        }
+        logger.warn("Snapshot $snapshotId polling timed out after ${pollMaxAttempts * pollIntervalMs}ms")
+        return null
+    }
+
+    private fun downloadSnapshot(snapshotId: String): String? {
+        return try {
+            val response = restClient.get()
+                .uri("/datasets/v3/snapshot/$snapshotId?format=json")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer $token")
+                .retrieve()
+                .body(String::class.java)
+
+            if (response.isNullOrBlank()) {
+                logger.warn("Empty snapshot $snapshotId download response")
+                null
+            } else {
+                extractPageHtmlFromJson(response)
+            }
+        } catch (e: Exception) {
+            logger.error("Snapshot $snapshotId download failed", e)
+            null
+        }
+    }
+
+    private fun extractStringField(json: String, field: String): String? {
+        val marker = "\"$field\":\""
+        val start = json.indexOf(marker)
+        if (start == -1) return null
+        val contentStart = start + marker.length
+        val end = json.indexOf("\"", contentStart)
+        if (end == -1) return null
+        return json.substring(contentStart, end)
     }
 
     /**
@@ -115,7 +250,9 @@ class BrightDataNaverShoppingCrawler(
         val startMarker = "\"page_html\":\""
         val startIndex = json.indexOf(startMarker)
         if (startIndex == -1) {
-            logger.warn("page_html field not found in response")
+            // 거부 사유 진단을 위해 응답 본문 앞부분을 함께 남김
+            val sample = json.take(500).replace('\n', ' ').replace('\r', ' ')
+            logger.warn("page_html field not found in response (len=${json.length}): $sample")
             return null
         }
 
@@ -213,71 +350,6 @@ class BrightDataNaverShoppingCrawler(
         // 3. 마지막 fallback - 첫 번째 큰 숫자+개 패턴은 위험하므로 제거
         logger.warn("Could not extract product count from HTML")
         return null
-    }
-
-    /**
-     * 전체 + 해외직구 상품수 동시 조회 (두 번의 API 호출)
-     * 해외직구 상품수는 productSet=overseas 파라미터를 사용해야 정확히 가져올 수 있음
-     */
-    fun getProductCountWithForeign(keyword: String): ProductCountWithForeignResult {
-        if (token.isBlank()) {
-            val error = ProductCountResult.Error(keyword, "BrightData token not configured")
-            return ProductCountWithForeignResult(keyword, error, error)
-        }
-
-        // 1. 전체 상품수 조회
-        val totalResult = try {
-            val searchUrl = buildSearchUrl(keyword)
-            logger.info("Fetching total product count for keyword: $keyword, url: $searchUrl")
-
-            val html = fetchPageHtml(searchUrl)
-            if (html == null) {
-                logger.warn("Failed to fetch page HTML for keyword: $keyword")
-                ProductCountResult.Error(keyword, "Failed to fetch page")
-            } else if (html.contains("접속이 일시적으로 제한") || html.contains("보안 확인")) {
-                logger.warn("Access blocked for keyword: $keyword")
-                ProductCountResult.Blocked(keyword)
-            } else {
-                val totalCount = extractProductCount(html)
-                if (totalCount != null) {
-                    logger.info("Total product count for '$keyword': $totalCount")
-                    ProductCountResult.Success(keyword, totalCount)
-                } else {
-                    ProductCountResult.NotFound(keyword)
-                }
-            }
-        } catch (e: Exception) {
-            logger.error("Error crawling total count for keyword: $keyword", e)
-            ProductCountResult.Error(keyword, e.message ?: "Unknown error")
-        }
-
-        // 2. 해외직구 상품수 조회 (productSet=overseas 파라미터 사용)
-        val foreignResult = try {
-            val foreignUrl = buildSearchUrl(keyword, overseas = true)
-            logger.info("Fetching foreign product count for keyword: $keyword, url: $foreignUrl")
-
-            val html = fetchPageHtml(foreignUrl)
-            if (html == null) {
-                logger.warn("Failed to fetch foreign page HTML for keyword: $keyword")
-                ProductCountResult.Error(keyword, "Failed to fetch page")
-            } else if (html.contains("접속이 일시적으로 제한") || html.contains("보안 확인")) {
-                logger.warn("Access blocked for foreign keyword: $keyword")
-                ProductCountResult.Blocked(keyword)
-            } else {
-                val foreignCount = extractProductCount(html)
-                if (foreignCount != null) {
-                    logger.info("Foreign product count for '$keyword': $foreignCount")
-                    ProductCountResult.Success(keyword, foreignCount)
-                } else {
-                    ProductCountResult.NotFound(keyword)
-                }
-            }
-        } catch (e: Exception) {
-            logger.error("Error crawling foreign count for keyword: $keyword", e)
-            ProductCountResult.Error(keyword, e.message ?: "Unknown error")
-        }
-
-        return ProductCountWithForeignResult(keyword, totalResult, foreignResult)
     }
 
     private fun buildSearchUrl(keyword: String, overseas: Boolean = false): String {
