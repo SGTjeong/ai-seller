@@ -1,6 +1,7 @@
 package com.ai.seller.external.naver.shopping
 
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpHeaders
@@ -27,7 +28,7 @@ class BrightDataNaverShoppingCrawler(
     @Value("\${brightdata.max-attempts:3}") private val maxAttempts: Int = 3,
     @Value("\${brightdata.retry-base-delay-ms:5000}") private val retryBaseDelayMs: Long = 5000,
     @Value("\${brightdata.poll-interval-ms:5000}") private val pollIntervalMs: Long = 5000,
-    @Value("\${brightdata.poll-max-attempts:36}") private val pollMaxAttempts: Int = 36
+    @Value("\${brightdata.poll-max-attempts:6}") private val pollMaxAttempts: Int = 6
 ) {
     private val logger = LoggerFactory.getLogger(BrightDataNaverShoppingCrawler::class.java)
 
@@ -352,15 +353,155 @@ class BrightDataNaverShoppingCrawler(
         return null
     }
 
-    private fun buildSearchUrl(keyword: String, overseas: Boolean = false): String {
+    private fun buildSearchUrl(keyword: String, overseas: Boolean = false, sort: String? = null): String {
         val encodedKeyword = URLEncoder.encode(keyword, StandardCharsets.UTF_8)
-        val baseUrl = "https://search.shopping.naver.com/search/all?query=$encodedKeyword&score=true"
-        return if (overseas) {
-            "$baseUrl&productSet=overseas"
-        } else {
-            baseUrl
+        val sb = StringBuilder("https://search.shopping.naver.com/search/all?query=$encodedKeyword&score=true")
+        if (overseas) sb.append("&productSet=overseas")
+        if (sort != null) sb.append("&sort=").append(sort)
+        return sb.toString()
+    }
+
+    /**
+     * 키워드 → 상위 N개 상품 리스트 (리뷰 많은 순).
+     * 정렬: sort=review.
+     * 추출 항목: 상품명, 가격, 판매처, 링크, 리뷰수, 이미지URL, 상품ID (없으면 null).
+     */
+    fun getTopProducts(keyword: String, limit: Int = 20): TopProductsResult {
+        if (token.isBlank()) {
+            return TopProductsResult.Error(keyword, "BrightData token not configured")
+        }
+        val url = buildSearchUrl(keyword, sort = "review")
+        var last: TopProductsResult = TopProductsResult.Error(keyword, "no attempts made")
+        for (attempt in 1..maxAttempts) {
+            last = crawlProductsOnce(keyword, url, limit, attempt)
+            if (last is TopProductsResult.Success && last.products.isNotEmpty()) return last
+            if (attempt < maxAttempts) {
+                val delay = retryBaseDelayMs * (1L shl (attempt - 1))
+                logger.warn("Retrying top products '$keyword' (attempt ${attempt + 1}/$maxAttempts) after ${delay}ms — last=$last")
+                try {
+                    Thread.sleep(delay)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return last
+                }
+            }
+        }
+        return last
+    }
+
+    private fun crawlProductsOnce(keyword: String, url: String, limit: Int, attempt: Int): TopProductsResult {
+        return try {
+            logger.info("Fetching top products for '$keyword' (attempt $attempt/$maxAttempts), url: $url")
+            val html = fetchPageHtml(url)
+            when {
+                html == null -> TopProductsResult.Error(keyword, "Failed to fetch page")
+                html.contains("접속이 일시적으로 제한") || html.contains("보안 확인") -> TopProductsResult.Blocked(keyword)
+                else -> {
+                    val products = extractProducts(html, limit)
+                    if (products.isEmpty()) {
+                        logger.warn("No products extracted for '$keyword'. HTML length=${html.length}, sample=${html.take(300).replace('\n', ' ')}")
+                        TopProductsResult.NotFound(keyword)
+                    } else {
+                        logger.info("Extracted ${products.size} products for '$keyword'")
+                        TopProductsResult.Success(keyword, products)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.error("Error crawling top products for '$keyword'", e)
+            TopProductsResult.Error(keyword, e.message ?: "Unknown error")
         }
     }
+
+    /**
+     * 네이버 쇼핑 검색결과 HTML에서 상품 카드 추출.
+     * 마크업이 자주 바뀌므로 다양한 셀렉터를 폴백으로 시도.
+     */
+    private fun extractProducts(html: String, limit: Int): List<NaverProduct> {
+        val doc = Jsoup.parse(html)
+        // 카드 컨테이너 후보 (네이버는 CSS 모듈 해시를 쓰므로 prefix 매칭)
+        val cardSelectors = listOf(
+            "[class*='basicList_item']",
+            "[class*='product_item']",
+            "[class*='adProduct_item']",
+            "li[class*='item']"
+        )
+        val cards = cardSelectors
+            .asSequence()
+            .map { sel -> doc.select(sel) }
+            .firstOrNull { it.isNotEmpty() }
+            ?: return emptyList()
+        return cards.asSequence()
+            .mapNotNull { parseProductCard(it) }
+            .distinctBy { it.link ?: it.title }
+            .take(limit)
+            .toList()
+    }
+
+    private fun parseProductCard(card: Element): NaverProduct? {
+        val title = card.selectFirst("[class*='title']")?.text()?.trim()
+            ?: card.selectFirst("a[title]")?.attr("title")?.takeIf { it.isNotBlank() }
+            ?: card.selectFirst("img[alt]")?.attr("alt")?.takeIf { it.isNotBlank() }
+
+        val link = listOf(
+            "a[class*='link']",
+            "a[href*='smartstore.naver.com']",
+            "a[href*='shopping.naver.com']",
+            "a[href]"
+        ).firstNotNullOfOrNull { sel ->
+            card.selectFirst(sel)?.attr("href")?.takeIf { it.isNotBlank() }
+        }
+
+        val priceText = card.selectFirst("[class*='price_num']")?.text()
+            ?: card.selectFirst("[class*='price'] em")?.text()
+            ?: card.selectFirst("[class*='price']")?.text()
+        val price = priceText?.replace(Regex("[^0-9]"), "")?.toLongOrNull()
+
+        val mall = card.selectFirst("[class*='mall_title'], [class*='mallName'], [class*='mall']")
+            ?.text()?.trim()?.takeIf { it.isNotBlank() }
+
+        val reviewText = card.selectFirst("[class*='etc_num_review'], [class*='review']")?.text()
+        val reviewCount = reviewText?.replace(Regex("[^0-9]"), "")?.toLongOrNull()
+
+        val imageUrl = card.selectFirst("img")?.let { img ->
+            img.attr("src").ifBlank { img.attr("data-src") }
+        }?.takeIf { it.isNotBlank() }
+
+        // 상품 id: 링크에서 추출 (smartstore.naver.com/.../products/{id} or .../catalog/{id})
+        val productId = link?.let { url ->
+            Regex("""/products/(\d+)|/catalog/(\d+)""").find(url)
+                ?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+        }
+
+        if (title == null && link == null) return null
+        return NaverProduct(
+            title = title,
+            price = price,
+            mall = mall,
+            link = link,
+            reviewCount = reviewCount,
+            imageUrl = imageUrl,
+            productId = productId
+        )
+    }
+}
+
+data class NaverProduct(
+    val title: String?,
+    val price: Long?,
+    val mall: String?,
+    val link: String?,
+    val reviewCount: Long?,
+    val imageUrl: String?,
+    val productId: String?
+)
+
+sealed class TopProductsResult {
+    abstract val keyword: String
+    data class Success(override val keyword: String, val products: List<NaverProduct>) : TopProductsResult()
+    data class NotFound(override val keyword: String) : TopProductsResult()
+    data class Blocked(override val keyword: String) : TopProductsResult()
+    data class Error(override val keyword: String, val message: String) : TopProductsResult()
 }
 
 data class ProductCountWithForeignResult(
